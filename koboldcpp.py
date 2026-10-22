@@ -2107,6 +2107,38 @@ def auto_set_backend_cli():
     if not found_new_backend:
         print(f"Auto Selected Default Backend (flag={cpusupport})\n")
 
+def resolve_kv_cache_types(quantkv, flash_attention):
+    """Resolve a KV-cache type to the native ABI's integer enum.
+
+    Returns (quant_type, key_type, value_type). Legacy numeric values remain
+    supported for existing .kcpps configs; invalid values fall back to f16.
+    """
+    aliases = {
+        "f16": (0, "f16"),
+        "0": (0, "f16"),
+        "bf16": (1, "bf16"),
+        "3": (1, "bf16"),  # legacy index
+        "q8_0": (2, "q8_0"),
+        "1": (2, "q8_0"),  # legacy index
+        "q5_1": (3, "q5_1"),
+        "q4_0": (4, "q4_0"),
+        "2": (4, "q4_0"),  # legacy index
+    }
+    requested = str(quantkv if quantkv is not None else "f16").strip().lower()
+    resolved = aliases.get(requested)
+    if resolved is None:
+        print(f"Warning: Unknown KV-cache type '{requested}'; falling back to f16.")
+        resolved = aliases["f16"]
+
+    quant_type, _ = resolved
+    key_type = quant_type
+    value_type = quant_type
+    if not flash_attention and quant_type > 1:
+        # llama.cpp requires Flash Attention for quantized V cache.
+        value_type = 0
+    return quant_type, key_type, value_type
+
+
 def load_model(model_filename):
     global args, calulated_gpu_overhead, savestate_limit
     inputs = load_model_inputs()
@@ -2154,26 +2186,20 @@ def load_model(model_filename):
     inputs.use_contextshift = (0 if args.noshift else 1)
     inputs.use_fastforward = (0 if args.nofastforward else 1)
     inputs.flash_attention =  (False if args.noflashattention else True)
-    if args.quantkv:
-        qkvstr = str(args.quantkv).lower()
-        qkvval = 0
-        if qkvstr=="bf16" or qkvstr=="3": #migration for old index based values
-            qkvval = 1
-        elif qkvstr=="q8_0" or qkvstr=="1":
-            qkvval = 2
-        elif qkvstr=="q5_1":
-            qkvval = 3
-        elif qkvstr=="q4_0" or qkvstr=="2":
-            qkvval = 4
-        if args.noflashattention:
-            inputs.quant_k = qkvval
-            inputs.quant_v = 0 if qkvval!=1 else qkvval
-            if qkvval>1:
-                print("\nWarning: Quantized KV was used without flash attention! This is NOT RECOMMENDED!\nOnly K cache can be quantized, and performance can suffer.\nIn some cases, it might even use more VRAM when doing a full offload.\nYou are strongly encouraged to use flash attention if you want to use quantkv.")
-        else:
-            inputs.quant_k = inputs.quant_v = qkvval
+    _, inputs.quant_k, inputs.quant_v = resolve_kv_cache_types(
+        args.quantkv, not args.noflashattention
+    )
+    kv_type_names = {0: "f16", 1: "bf16", 2: "q8_0", 3: "q5_1", 4: "q4_0"}
+    if inputs.quant_k != inputs.quant_v:
+        print(
+            "KV cache: K={0}, V={1} (Flash Attention disabled; "
+            "quantized V cache is unavailable).".format(
+                kv_type_names.get(inputs.quant_k, "unknown"),
+                kv_type_names.get(inputs.quant_v, "unknown"),
+            )
+        )
     else:
-        inputs.quant_k = inputs.quant_v = 0
+        print("KV cache: K/V={0}.".format(kv_type_names.get(inputs.quant_k, "unknown")))
     inputs.batchsize = args.batchsize
     inputs.ubatchsize = args.ubatchsize
     inputs.autofit = args.autofit
