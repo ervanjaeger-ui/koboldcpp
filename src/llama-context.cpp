@@ -16,7 +16,10 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -28,6 +31,53 @@
 
 //kcpp: use a global flag to toggle pipeline parallelism to avoid messing with ctx params
 bool kcpp_pipeline_parallelism = false;
+
+// Optional native KV-cache override for builds/frontends that do not expose
+// llama_context_params::type_k/type_v. Unset means no change.
+static bool kcpp_parse_kv_cache_type(const char * value, ggml_type & type) {
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+
+    std::string name(value);
+    std::transform(name.begin(), name.end(), name.begin(),
+        [](unsigned char c) { return (char) std::tolower(c); });
+
+    if (name == "f16") {
+        type = GGML_TYPE_F16;
+    } else if (name == "bf16") {
+        type = GGML_TYPE_BF16;
+    } else if (name == "q8_0") {
+        type = GGML_TYPE_Q8_0;
+    } else if (name == "q5_1") {
+        type = GGML_TYPE_Q5_1;
+    } else if (name == "q4_0") {
+        type = GGML_TYPE_Q4_0;
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+static void kcpp_apply_kv_cache_type_override(llama_context_params & params) {
+    const char * requested = std::getenv("KCPP_KV_CACHE_TYPE");
+    if (requested == nullptr || *requested == '\0') {
+        return;
+    }
+
+    ggml_type type;
+    if (!kcpp_parse_kv_cache_type(requested, type)) {
+        LLAMA_LOG_WARN("%s: ignoring unknown KCPP_KV_CACHE_TYPE='%s' (use f16, bf16, q8_0, q5_1, or q4_0)\n",
+            __func__, requested);
+        return;
+    }
+
+    params.type_k = type;
+    params.type_v = type;
+    LLAMA_LOG_INFO("%s: KCPP_KV_CACHE_TYPE override: K/V cache = %s\n",
+        __func__, ggml_type_name(type));
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -3909,6 +3959,8 @@ llama_context * llama_init_from_model(
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
     }
+
+    kcpp_apply_kv_cache_type_override(params);
 
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
